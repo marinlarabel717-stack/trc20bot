@@ -10,7 +10,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from .config import Settings
 from .models import TransferEvent, WatchAddress
 from .store import Store
-from .trongrid import TronGridClient, normalize_transfer
+from .trongrid import TronGridClient, TronGridRateLimitError, normalize_transfer
 from .ui import rich_text
 
 
@@ -74,7 +74,11 @@ class MonitorService:
         today_start = datetime.now(self.timezone).replace(hour=0, minute=0, second=0, microsecond=0)
         today_start_ms = int(today_start.timestamp() * 1000)
         today_stats = self.store.get_stats(today_start_ms)
-        _, usdt_balance = await self.client.fetch_account_balance(event.owner_address)
+        try:
+            _, usdt_balance = await self.client.fetch_account_balance(event.owner_address)
+            balance_text = format_amount(usdt_balance)
+        except TronGridRateLimitError:
+            balance_text = "限流中"
         trade_type = "收入" if event.direction == "in" else "支出"
 
         text, entities = rich_text(
@@ -100,7 +104,7 @@ class MonitorService:
                 ("💰", "today_profit"),
                 (f"今日利润：{format_amount(today_stats.net)}\n", None),
                 ("🪙", "usdt_balance"),
-                (f"USDT余额：{format_amount(usdt_balance)}", None),
+                (f"USDT余额：{balance_text}", None),
             ]
         )
         keyboard = InlineKeyboardMarkup(

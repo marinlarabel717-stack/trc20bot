@@ -17,11 +17,18 @@ from .models import TransferEvent, WatchAddress
 logger = logging.getLogger(__name__)
 
 
+class TronGridRateLimitError(RuntimeError):
+    """Raised when TronGrid is temporarily rate limited."""
+
+
 class TronGridClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._session: aiohttp.ClientSession | None = None
         self._api_cycle = cycle(settings.trongrid_api_keys or [""])
+        self._rate_limited_until = 0.0
+        self._balance_cache: dict[str, tuple[float, tuple[float, float]]] = {}
+        self._balance_cache_ttl_seconds = 60.0
 
     async def close(self) -> None:
         if self._session is not None:
@@ -40,7 +47,22 @@ class TronGridClient:
             headers["TRON-PRO-API-KEY"] = api_key
         return headers
 
+    def _set_rate_limit_cooldown(self, retry_after: str | None = None) -> None:
+        cooldown_seconds = 30.0
+        if retry_after:
+            try:
+                cooldown_seconds = max(cooldown_seconds, float(retry_after))
+            except ValueError:
+                pass
+        self._rate_limited_until = max(self._rate_limited_until, time.time() + cooldown_seconds)
+
+    def _ensure_not_rate_limited(self) -> None:
+        remaining = self._rate_limited_until - time.time()
+        if remaining > 0:
+            raise TronGridRateLimitError(f"TronGrid rate limited, retry after {remaining:.0f}s")
+
     async def _request_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._ensure_not_rate_limited()
         session = await self._session_or_create()
         candidates = self.settings.trongrid_api_keys or [""]
         last_error: Exception | None = None
@@ -53,7 +75,8 @@ class TronGridClient:
                     headers=self._headers(api_key),
                 ) as response:
                     if response.status in {403, 429}:
-                        last_error = RuntimeError(f"TronGrid rate limited: {response.status}")
+                        self._set_rate_limit_cooldown(response.headers.get("Retry-After"))
+                        last_error = TronGridRateLimitError(f"TronGrid rate limited: {response.status}")
                         continue
                     response.raise_for_status()
                     payload = await response.json()
@@ -95,10 +118,14 @@ class TronGridClient:
                     break
                 seen.add(fingerprint)
                 request_params["fingerprint"] = fingerprint
-            payload = await self._request_json(
-                f"/accounts/{watch.address}/transactions/trc20",
-                request_params,
-            )
+            try:
+                payload = await self._request_json(
+                    f"/accounts/{watch.address}/transactions/trc20",
+                    request_params,
+                )
+            except TronGridRateLimitError:
+                logger.warning("TronGrid rate limited while fetching transfers for %s", watch.address)
+                break
             data = payload.get("data") or []
             if not isinstance(data, list):
                 data = []
@@ -109,10 +136,21 @@ class TronGridClient:
         return items
 
     async def fetch_account_balance(self, address: str) -> tuple[float, float]:
+        cached = self._balance_cache.get(address)
+        now = time.time()
+        if cached and now - cached[0] <= self._balance_cache_ttl_seconds:
+            return cached[1]
+
         trx_balance = 0.0
         usdt_balance = 0.0
 
-        account_payload = await self._request_json(f"/accounts/{address}")
+        try:
+            account_payload = await self._request_json(f"/accounts/{address}")
+        except TronGridRateLimitError:
+            if cached:
+                logger.warning("Using cached balance for %s due to TronGrid rate limit", address)
+                return cached[1]
+            raise
         account_rows = account_payload.get("data") or []
         if isinstance(account_rows, list) and account_rows:
             row = account_rows[0] if isinstance(account_rows[0], dict) else {}
@@ -121,10 +159,18 @@ class TronGridClient:
             usdt_balance = _extract_usdt_balance(trc20_rows, self.settings.trc20_usdt_contract)
 
         if usdt_balance <= 0:
-            token_payload = await self._request_json(f"/accounts/{address}/trc20")
-            token_rows = token_payload.get("data") or []
-            usdt_balance = _extract_usdt_balance(token_rows, self.settings.trc20_usdt_contract)
-        return trx_balance, usdt_balance
+            try:
+                token_payload = await self._request_json(f"/accounts/{address}/trc20")
+                token_rows = token_payload.get("data") or []
+                usdt_balance = _extract_usdt_balance(token_rows, self.settings.trc20_usdt_contract)
+            except TronGridRateLimitError:
+                if cached:
+                    logger.warning("Using cached USDT balance for %s due to TronGrid rate limit", address)
+                    return cached[1]
+                raise
+        balances = (trx_balance, usdt_balance)
+        self._balance_cache[address] = (now, balances)
+        return balances
 
 
 def _extract_usdt_balance(rows: Any, contract_address: str) -> float:

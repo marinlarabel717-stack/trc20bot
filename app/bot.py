@@ -22,7 +22,7 @@ from telegram.ext import (
 from .config import Settings, load_settings
 from .service import MonitorService, format_amount
 from .store import Store
-from .trongrid import TronGridClient
+from .trongrid import TronGridClient, TronGridRateLimitError
 from .ui import dashboard_keyboard, detail_keyboard, rich_text, watches_keyboard
 
 
@@ -226,9 +226,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         chunks: list[str] = []
         for row in watches:
-            trx_balance, usdt_balance = await client.fetch_account_balance(row.address)
+            try:
+                trx_balance, usdt_balance = await client.fetch_account_balance(row.address)
+                trx_text = format_amount(trx_balance)
+                usdt_text = format_amount(usdt_balance)
+            except TronGridRateLimitError:
+                trx_text = "限流中"
+                usdt_text = "限流中"
             chunks.append(
-                f"{row.remark or '未备注'}\n{row.address}\nTRX：{format_amount(trx_balance)}\nUSDT：{format_amount(usdt_balance)}"
+                f"{row.remark or '未备注'}\n{row.address}\nTRX：{trx_text}\nUSDT：{usdt_text}"
             )
         text, entities = build_panel_text("全部余额", "\n\n".join(chunks), "money")
         await render_callback(update, text, entities, detail_keyboard())
@@ -297,12 +303,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             text, entities = rich_text([("⚠️", "warn"), (" 没找到这个地址。", None)])
             await render_callback(update, text, entities, detail_keyboard("menu:watches"))
             return
-        trx_balance, usdt_balance = await client.fetch_account_balance(row.address)
+        try:
+            trx_balance, usdt_balance = await client.fetch_account_balance(row.address)
+            trx_text = format_amount(trx_balance)
+            usdt_text = format_amount(usdt_balance)
+        except TronGridRateLimitError:
+            trx_text = "限流中"
+            usdt_text = "限流中"
         body = (
             f"{row.remark or '未备注'}\n"
             f"{row.address}\n"
-            f"TRX：{format_amount(trx_balance)}\n"
-            f"USDT：{format_amount(usdt_balance)}"
+            f"TRX：{trx_text}\n"
+            f"USDT：{usdt_text}"
         )
         text, entities = build_panel_text("地址余额", body, "money")
         await render_callback(update, text, entities, detail_keyboard("menu:watches"))
@@ -368,6 +380,10 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await monitor.poll_once(context.application.bot)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled bot error", exc_info=context.error)
+
+
 async def post_shutdown(application: Application) -> None:
     client: TronGridClient = application.bot_data["client"]
     await client.close()
@@ -387,6 +403,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    application.add_error_handler(on_error)
 
     if application.job_queue is not None:
         application.job_queue.run_repeating(
