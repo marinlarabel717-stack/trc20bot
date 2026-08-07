@@ -5,12 +5,13 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 from .config import Settings
 from .models import TransferEvent, WatchAddress
 from .store import Store
 from .trongrid import TronGridClient, normalize_transfer
+from .ui import rich_text
 
 
 logger = logging.getLogger(__name__)
@@ -64,24 +65,37 @@ class MonitorService:
 
     async def _send_notification(self, bot: Bot, event: TransferEvent) -> None:
         direction_text = "转入提醒" if event.direction == "in" else "转出提醒"
-        arrow = "⬇️" if event.direction == "in" else "⬆️"
+        arrow = "✨" if event.direction == "in" else "⚠️"
         block_time = datetime.fromtimestamp(event.block_timestamp / 1000, tz=self.timezone).strftime("%Y-%m-%d %H:%M:%S")
         remark = event.remark or "未备注"
-        lines = [
-            f"{arrow} {direction_text}",
-            f"备注：{remark}",
-            f"监听地址：{event.owner_address}",
-            f"金额：{format_amount(event.amount)} USDT",
-            f"来源：{event.from_address}",
-            f"去向：{event.to_address}",
-            f"时间：{block_time}",
-            f"确认：{'是' if event.confirmed else '否'}",
-            f"TX：{event.tx_hash}",
-            f"链接：https://tronscan.org/#/transaction/{event.tx_hash}",
-        ]
-        text = "\n".join(lines)
+        text, entities = rich_text(
+            [
+                (arrow, "sparkle" if event.direction == "in" else "warn"),
+                (f" {direction_text}\n", None),
+                ("🖥", "screen"),
+                (f" 备注：{remark}\n", None),
+                ("💰", "money"),
+                (f" 金额：{format_amount(event.amount)} USDT\n", None),
+                ("🔵", "blue"),
+                (f" 监听地址：{event.owner_address}\n", None),
+                ("⭐️", "star"),
+                (f" 来源：{event.from_address}\n", None),
+                ("⭐️", "star"),
+                (f" 去向：{event.to_address}\n", None),
+                ("⏱️", "clock"),
+                (f" 时间：{block_time}\n", None),
+                ("📷", "camera"),
+                (f" TX：{event.tx_hash}", None),
+            ]
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📷 查看交易", url=f"https://tronscan.org/#/transaction/{event.tx_hash}")],
+                [InlineKeyboardButton("🏠 打开后台", callback_data="menu:home")],
+            ]
+        )
         for chat_id in self.settings.notify_chat_ids:
             try:
-                await bot.send_message(chat_id=chat_id, text=text)
+                await bot.send_message(chat_id=chat_id, text=text, entities=entities, reply_markup=keyboard)
             except Exception:
                 logger.exception("Failed to send notification to %s", chat_id)

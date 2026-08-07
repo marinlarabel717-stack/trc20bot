@@ -7,13 +7,23 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Update
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import InlineKeyboardMarkup, Message, Update
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from .config import Settings, load_settings
 from .service import MonitorService, format_amount
 from .store import Store
 from .trongrid import TronGridClient
+from .ui import dashboard_keyboard, detail_keyboard, rich_text, watches_keyboard
 
 
 logging.basicConfig(
@@ -23,6 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ADDRESS_RE = re.compile(r"^T[1-9A-HJ-NP-Za-km-z]{33}$")
+PENDING_ACTION_KEY = "pending_action"
 
 
 def get_services(context: ContextTypes.DEFAULT_TYPE) -> tuple[Settings, Store, TronGridClient, MonitorService]:
@@ -48,14 +59,21 @@ async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     settings, _, _, _ = get_services(context)
     if is_admin(user.id, settings):
         return True
-    if update.message is not None:
-        await update.message.reply_text("无权限。")
+    if update.effective_message is not None:
+        await update.effective_message.reply_text("无权限。")
     return False
 
 
-def format_watch_line(row) -> str:
-    remark = row.remark or "未备注"
-    return f"{row.id}. {remark}\n{row.address}"
+def set_pending_action(context: ContextTypes.DEFAULT_TYPE, action: str | None) -> None:
+    if action is None:
+        context.user_data.pop(PENDING_ACTION_KEY, None)
+    else:
+        context.user_data[PENDING_ACTION_KEY] = action
+
+
+def get_pending_action(context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    value = context.user_data.get(PENDING_ACTION_KEY)
+    return str(value) if value else None
 
 
 def parse_period(period: str, timezone_name: str) -> tuple[str, int | None]:
@@ -71,158 +89,264 @@ def parse_period(period: str, timezone_name: str) -> tuple[str, int | None]:
     return "全部", None
 
 
-def format_event(row, timezone_name: str) -> str:
-    tz = ZoneInfo(timezone_name)
-    when = datetime.fromtimestamp(int(row["block_timestamp"]) / 1000, tz=tz).strftime("%m-%d %H:%M")
-    direction = "转入" if row["direction"] == "in" else "转出"
-    remark = str(row["remark"] or "未备注")
-    return f"{when} {direction} {format_amount(float(row['amount']))} USDT\n{remark} | {row['tx_hash']}"
+def format_watch_line(row) -> str:
+    remark = row.remark or "未备注"
+    return f"{row.id}. {remark}\n{row.address}"
+
+
+def build_dashboard_text(watch_count: int, today_count: int, month_net: float) -> tuple[str, list]:
+    return rich_text(
+        [
+            ("🧠", "brain"),
+            (" TRC20 管理后台\n\n", None),
+            ("🖥", "screen"),
+            (f" 监听地址：{watch_count} 个\n", None),
+            ("⏱️", "clock"),
+            (f" 今日记录：{today_count} 笔\n", None),
+            ("💰", "money"),
+            (f" 本月净额：{format_amount(month_net)} USDT\n", None),
+            ("✨", "sparkle"),
+            (" 点下面按钮直接操作", None),
+        ]
+    )
+
+
+def build_panel_text(title: str, body: str, emoji_key: str) -> tuple[str, list]:
+    emoji_char = {
+        "screen": "🖥",
+        "money": "💰",
+        "clock": "⏱️",
+        "camera": "📷",
+        "ok": "🆗",
+        "warn": "⚠️",
+        "plus": "➕",
+        "light": "💡",
+    }[emoji_key]
+    return rich_text([(emoji_char, emoji_key), (f" {title}\n\n{body}", None)])
+
+
+async def render_message(
+    target: Message,
+    text: str,
+    entities,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    await target.reply_text(text=text, entities=entities, reply_markup=reply_markup)
+
+
+async def render_callback(
+    update: Update,
+    text: str,
+    entities,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    try:
+        await query.edit_message_text(text=text, entities=entities, reply_markup=reply_markup)
+    except BadRequest:
+        if query.message is not None:
+            await query.message.reply_text(text=text, entities=entities, reply_markup=reply_markup)
+
+
+async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, *, use_edit: bool) -> None:
+    settings, store, _, _ = get_services(context)
+    _, today_since = parse_period("day", settings.timezone_name)
+    _, month_since = parse_period("month", settings.timezone_name)
+    watches = await run_blocking(store.list_watches)
+    today_rows = await run_blocking(store.list_events, since_ts=today_since, limit=9999)
+    month_stats = await run_blocking(store.get_stats, month_since)
+    text, entities = build_dashboard_text(len(watches), len(today_rows), month_stats.net)
+    if use_edit and update.callback_query is not None:
+        await render_callback(update, text, entities, dashboard_keyboard())
+    elif update.effective_message is not None:
+        await render_message(update.effective_message, text, entities, dashboard_keyboard())
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update, context):
         return
-    text = (
-        "TRC20 监听机器人已启动。\n\n"
-        "/addaddr <地址> [备注]\n"
-        "/deladdr <id|地址>\n"
-        "/listaddr\n"
-        "/balance [id|地址]\n"
-        "/history [day|month|all] [limit]\n"
-        "/stats [day|month|all]\n"
-        "/tx <hash>\n"
-        "/scan"
-    )
-    if update.message is not None:
-        await update.message.reply_text(text)
+    set_pending_action(context, None)
+    await show_dashboard(update, context, use_edit=False)
 
 
-async def addaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update, context):
         return
-    if update.message is None:
+    query = update.callback_query
+    if query is None:
         return
-    if not context.args:
-        await update.message.reply_text("用法：/addaddr <TRC20地址> [备注]")
-        return
-    address = context.args[0].strip()
-    if not ADDRESS_RE.match(address):
-        await update.message.reply_text("地址格式不对。")
-        return
-    remark = " ".join(context.args[1:]).strip()
-    _, store, _, _ = get_services(context)
-    watch = await run_blocking(store.add_watch, address, remark)
-    await update.message.reply_text(f"已保存监听地址。\n\n{format_watch_line(watch)}")
+    await query.answer()
+    set_pending_action(context, None)
 
+    settings, store, client, monitor = get_services(context)
+    data = str(query.data or "")
+    parts = data.split(":")
 
-async def deladdr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context):
-        return
-    if update.message is None:
-        return
-    if not context.args:
-        await update.message.reply_text("用法：/deladdr <id|地址>")
-        return
-    _, store, _, _ = get_services(context)
-    deleted = await run_blocking(store.delete_watch, context.args[0])
-    await update.message.reply_text("已删除。" if deleted else "没找到对应地址。")
-
-
-async def listaddr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context):
-        return
-    if update.message is None:
-        return
-    _, store, _, _ = get_services(context)
-    rows = await run_blocking(store.list_watches)
-    if not rows:
-        await update.message.reply_text("当前还没有监听地址。")
-        return
-    text = "监听地址列表：\n\n" + "\n\n".join(format_watch_line(row) for row in rows)
-    await update.message.reply_text(text)
-
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context):
-        return
-    if update.message is None:
-        return
-    _, store, client, _ = get_services(context)
-    if context.args:
-        row = await run_blocking(store.get_watch, context.args[0])
-        rows = [row] if row is not None else []
-    else:
-        rows = await run_blocking(store.list_watches)
-    if not rows:
-        await update.message.reply_text("没找到要查询的地址。")
+    if data == "menu:home":
+        await show_dashboard(update, context, use_edit=True)
         return
 
-    lines = []
-    for row in rows:
+    if data == "menu:add":
+        text, entities = rich_text(
+            [
+                ("➕", "plus"),
+                (" 添加监听地址\n\n", None),
+                ("💡", "light"),
+                (" 直接发送：\n地址 备注\n\n示例：\nTXXX 收款主地址", None),
+            ]
+        )
+        set_pending_action(context, "add_watch")
+        await render_callback(update, text, entities, detail_keyboard())
+        return
+
+    if data == "menu:watches":
+        watches = await run_blocking(store.list_watches)
+        if not watches:
+            text, entities = rich_text([("⚠️", "warn"), (" 当前还没有监听地址。", None)])
+            await render_callback(update, text, entities, detail_keyboard())
+            return
+        body = "\n\n".join(format_watch_line(row) for row in watches)
+        text, entities = build_panel_text("地址列表", body, "screen")
+        await render_callback(update, text, entities, watches_keyboard([row.id for row in watches]))
+        return
+
+    if data == "menu:scan":
+        inserted = await monitor.poll_once(context.application.bot)
+        text, entities = rich_text([("🆗", "ok"), (f" 扫描完成\n\n新增记录：{inserted} 笔", None)])
+        await render_callback(update, text, entities, detail_keyboard())
+        return
+
+    if data == "menu:balance_all":
+        watches = await run_blocking(store.list_watches)
+        if not watches:
+            text, entities = rich_text([("⚠️", "warn"), (" 当前还没有监听地址。", None)])
+            await render_callback(update, text, entities, detail_keyboard())
+            return
+        chunks: list[str] = []
+        for row in watches:
+            trx_balance, usdt_balance = await client.fetch_account_balance(row.address)
+            chunks.append(
+                f"{row.remark or '未备注'}\n{row.address}\nTRX：{format_amount(trx_balance)}\nUSDT：{format_amount(usdt_balance)}"
+            )
+        text, entities = build_panel_text("全部余额", "\n\n".join(chunks), "money")
+        await render_callback(update, text, entities, detail_keyboard())
+        return
+
+    if data.startswith("menu:history:"):
+        period = parts[2]
+        label, since_ts = parse_period(period, settings.timezone_name)
+        rows = await run_blocking(store.list_events, since_ts=since_ts, limit=settings.history_default_limit)
+        if not rows:
+            text, entities = rich_text([("⚠️", "warn"), (f" {label}暂无记录。", None)])
+            await render_callback(update, text, entities, detail_keyboard())
+            return
+        lines = []
+        tz = ZoneInfo(settings.timezone_name)
+        for row in rows:
+            when = datetime.fromtimestamp(int(row["block_timestamp"]) / 1000, tz=tz).strftime("%m-%d %H:%M")
+            direction = "转入" if row["direction"] == "in" else "转出"
+            lines.append(f"{when} {direction} {format_amount(float(row['amount']))} USDT\n{row['remark'] or '未备注'} | {row['tx_hash']}")
+        text, entities = build_panel_text(f"{label}记录", "\n\n".join(lines), "clock")
+        await render_callback(update, text, entities, detail_keyboard())
+        return
+
+    if data.startswith("menu:stats:"):
+        period = parts[2]
+        label, since_ts = parse_period(period, settings.timezone_name)
+        stats = await run_blocking(store.get_stats, since_ts)
+        body = (
+            f"转入笔数：{stats.count_in}\n"
+            f"转出笔数：{stats.count_out}\n"
+            f"转入总额：{format_amount(stats.amount_in)} USDT\n"
+            f"转出总额：{format_amount(stats.amount_out)} USDT\n"
+            f"净额：{format_amount(stats.net)} USDT"
+        )
+        text, entities = build_panel_text(f"{label}收益统计", body, "money")
+        await render_callback(update, text, entities, detail_keyboard())
+        return
+
+    if data == "menu:tx":
+        text, entities = rich_text(
+            [
+                ("📷", "camera"),
+                (" 查询交易\n\n", None),
+                ("💡", "light"),
+                (" 直接发送交易哈希，我来返回详情和链接。", None),
+            ]
+        )
+        set_pending_action(context, "tx_lookup")
+        await render_callback(update, text, entities, detail_keyboard())
+        return
+
+    if data.startswith("watch:delete:"):
+        watch_id = parts[2]
+        deleted = await run_blocking(store.delete_watch, watch_id)
+        if deleted:
+            text, entities = rich_text([("🆗", "ok"), (" 删除成功。", None)])
+        else:
+            text, entities = rich_text([("⚠️", "warn"), (" 没找到这个地址。", None)])
+        await render_callback(update, text, entities, detail_keyboard("menu:watches"))
+        return
+
+    if data.startswith("watch:balance:"):
+        watch_id = parts[2]
+        row = await run_blocking(store.get_watch, watch_id)
+        if row is None:
+            text, entities = rich_text([("⚠️", "warn"), (" 没找到这个地址。", None)])
+            await render_callback(update, text, entities, detail_keyboard("menu:watches"))
+            return
         trx_balance, usdt_balance = await client.fetch_account_balance(row.address)
-        lines.append(
+        body = (
             f"{row.remark or '未备注'}\n"
             f"{row.address}\n"
             f"TRX：{format_amount(trx_balance)}\n"
             f"USDT：{format_amount(usdt_balance)}"
         )
-    await update.message.reply_text("\n\n".join(lines))
+        text, entities = build_panel_text("地址余额", body, "money")
+        await render_callback(update, text, entities, detail_keyboard("menu:watches"))
+        return
+
+    text, entities = rich_text([("⚠️", "warn"), (" 暂不支持这个按钮。", None)])
+    await render_callback(update, text, entities, detail_keyboard())
 
 
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update, context):
         return
-    if update.message is None:
+    message = update.effective_message
+    if message is None or not message.text:
         return
+    action = get_pending_action(context)
     settings, store, _, _ = get_services(context)
-    period = context.args[0] if context.args else "all"
-    limit = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else settings.history_default_limit
-    label, since_ts = parse_period(period, settings.timezone_name)
-    rows = await run_blocking(store.list_events, since_ts=since_ts, limit=limit)
-    if not rows:
-        await update.message.reply_text(f"{label}暂无记录。")
-        return
-    text = f"{label}历史记录：\n\n" + "\n\n".join(format_event(row, settings.timezone_name) for row in rows)
-    await update.message.reply_text(text)
 
+    if action == "add_watch":
+        raw = message.text.strip()
+        parts = raw.split(maxsplit=1)
+        address = parts[0].strip() if parts else ""
+        remark = parts[1].strip() if len(parts) > 1 else ""
+        if not ADDRESS_RE.match(address):
+            text, entities = rich_text([("⚠️", "warn"), (" 地址格式不对，请重新发送。", None)])
+            await render_message(message, text, entities, detail_keyboard())
+            return
+        watch = await run_blocking(store.add_watch, address, remark)
+        set_pending_action(context, None)
+        text, entities = build_panel_text("保存成功", format_watch_line(watch), "ok")
+        await render_message(message, text, entities, detail_keyboard())
+        return
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context):
-        return
-    if update.message is None:
-        return
-    settings, store, _, _ = get_services(context)
-    period = context.args[0] if context.args else "month"
-    label, since_ts = parse_period(period, settings.timezone_name)
-    summary = await run_blocking(store.get_stats, since_ts)
-    text = (
-        f"{label}收益统计\n\n"
-        f"转入笔数：{summary.count_in}\n"
-        f"转出笔数：{summary.count_out}\n"
-        f"转入总额：{format_amount(summary.amount_in)} USDT\n"
-        f"转出总额：{format_amount(summary.amount_out)} USDT\n"
-        f"净额：{format_amount(summary.net)} USDT"
-    )
-    await update.message.reply_text(text)
-
-
-async def tx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context):
-        return
-    if update.message is None:
-        return
-    if not context.args:
-        await update.message.reply_text("用法：/tx <交易哈希>")
-        return
-    settings, store, _, _ = get_services(context)
-    rows = await run_blocking(store.find_events_by_tx_hash, context.args[0].strip())
-    if not rows:
-        await update.message.reply_text("本地没有这笔交易记录。")
-        return
-    parts = []
-    for row in rows:
+    if action == "tx_lookup":
+        tx_hash = message.text.strip()
+        rows = await run_blocking(store.find_events_by_tx_hash, tx_hash)
+        set_pending_action(context, None)
+        if not rows:
+            text, entities = rich_text([("⚠️", "warn"), (" 本地没有这笔交易记录。", None)])
+            await render_message(message, text, entities, detail_keyboard())
+            return
+        row = rows[0]
         when = datetime.fromtimestamp(int(row["block_timestamp"]) / 1000, tz=ZoneInfo(settings.timezone_name)).strftime("%Y-%m-%d %H:%M:%S")
-        parts.append(
+        body = (
             f"备注：{row['remark'] or '未备注'}\n"
             f"监听地址：{row['owner_address']}\n"
             f"方向：{'转入' if row['direction'] == 'in' else '转出'}\n"
@@ -230,20 +354,13 @@ async def tx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"来源：{row['from_address']}\n"
             f"去向：{row['to_address']}\n"
             f"时间：{when}\n"
-            f"确认：{'是' if row['confirmed'] else '否'}\n"
-            f"链接：https://tronscan.org/#/transaction/{row['tx_hash']}"
+            f"确认：{'是' if row['confirmed'] else '否'}"
         )
-    await update.message.reply_text("\n\n".join(parts))
-
-
-async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context):
+        text, entities = build_panel_text("交易详情", body, "camera")
+        await render_message(message, text, entities, detail_keyboard(tx_hash=row["tx_hash"]))
         return
-    if update.message is None:
-        return
-    _, _, _, monitor = get_services(context)
-    inserted = await monitor.poll_once(context.application.bot)
-    await update.message.reply_text(f"扫描完成，新记录 {inserted} 笔。")
+
+    await show_dashboard(update, context, use_edit=False)
 
 
 async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -268,15 +385,8 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["monitor"] = monitor
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", start))
-    application.add_handler(CommandHandler("addaddr", addaddr))
-    application.add_handler(CommandHandler("deladdr", deladdr))
-    application.add_handler(CommandHandler("listaddr", listaddr))
-    application.add_handler(CommandHandler("balance", balance))
-    application.add_handler(CommandHandler("history", history))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("tx", tx))
-    application.add_handler(CommandHandler("scan", scan))
+    application.add_handler(CallbackQueryHandler(on_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     if application.job_queue is not None:
         application.job_queue.run_repeating(
