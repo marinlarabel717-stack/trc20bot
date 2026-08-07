@@ -22,6 +22,12 @@ def format_amount(value: float) -> str:
     return text or "0"
 
 
+def short_hash(tx_hash: str) -> str:
+    if len(tx_hash) <= 12:
+        return tx_hash
+    return f"{tx_hash[:4]}…{tx_hash[-4:]}"
+
+
 class MonitorService:
     def __init__(self, settings: Settings, store: Store, client: TronGridClient) -> None:
         self.settings = settings
@@ -64,28 +70,37 @@ class MonitorService:
         return inserted_count
 
     async def _send_notification(self, bot: Bot, event: TransferEvent) -> None:
-        direction_text = "转入提醒" if event.direction == "in" else "转出提醒"
-        arrow = "✨" if event.direction == "in" else "⚠️"
         block_time = datetime.fromtimestamp(event.block_timestamp / 1000, tz=self.timezone).strftime("%Y-%m-%d %H:%M:%S")
-        remark = event.remark or "未备注"
+        today_start = datetime.now(self.timezone).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_ms = int(today_start.timestamp() * 1000)
+        today_stats = self.store.get_stats(today_start_ms)
+        _, usdt_balance = await self.client.fetch_account_balance(event.owner_address)
+        trade_type = "收入" if event.direction == "in" else "支出"
+
         text, entities = rich_text(
             [
-                (arrow, "sparkle" if event.direction == "in" else "warn"),
-                (f" {direction_text}\n", None),
-                ("🖥", "screen"),
-                (f" 备注：{remark}\n", None),
-                ("💰", "money"),
-                (f" 金额：{format_amount(event.amount)} USDT\n", None),
-                ("🔵", "blue"),
-                (f" 监听地址：{event.owner_address}\n", None),
-                ("⭐️", "star"),
-                (f" 来源：{event.from_address}\n", None),
-                ("⭐️", "star"),
-                (f" 去向：{event.to_address}\n", None),
-                ("⏱️", "clock"),
-                (f" 时间：{block_time}\n", None),
-                ("📷", "camera"),
-                (f" TX：{event.tx_hash}", None),
+                ("📢", "trade_type"),
+                (f"交易类型：{trade_type}\n", None),
+                ("🪙", "trade_amount"),
+                (f"交易金额：{format_amount(event.amount)} USDT\n", None),
+                ("⬆️", "addr_out"),
+                ("出账地址：\n", None),
+                (f"{event.from_address}\n", None),
+                ("⬇️", "addr_in"),
+                ("入账地址：\n", None),
+                (f"{event.to_address}\n", None),
+                ("✏️", "trade_time"),
+                (f"交易时间：{block_time}\n", None),
+                ("💊", "trade_hash"),
+                (f"交易哈希：{short_hash(event.tx_hash)}\n\n", None),
+                ("➕", "today_income"),
+                (f"今日收入：{format_amount(today_stats.amount_in)}\n", None),
+                ("🚫", "today_expense"),
+                (f"今日支出：{format_amount(today_stats.amount_out)}\n", None),
+                ("💰", "today_profit"),
+                (f"今日利润：{format_amount(today_stats.net)}\n", None),
+                ("🪙", "usdt_balance"),
+                (f"USDT余额：{format_amount(usdt_balance)}", None),
             ]
         )
         keyboard = InlineKeyboardMarkup(
