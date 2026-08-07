@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 ADDRESS_RE = re.compile(r"^T[1-9A-HJ-NP-Za-km-z]{33}$")
 PENDING_ACTION_KEY = "pending_action"
+DISPLAY_TIMEZONE_NAME = "Asia/Shanghai"
 
 
 def get_services(context: ContextTypes.DEFAULT_TYPE) -> tuple[Settings, Store, TronGridClient, MonitorService]:
@@ -76,7 +77,7 @@ def get_pending_action(context: ContextTypes.DEFAULT_TYPE) -> str | None:
     return str(value) if value else None
 
 
-def parse_period(period: str, timezone_name: str) -> tuple[str, int | None]:
+def parse_period(period: str, timezone_name: str = DISPLAY_TIMEZONE_NAME) -> tuple[str, int | None]:
     tz = ZoneInfo(timezone_name)
     now = datetime.now(tz)
     normalized = period.strip().lower() or "all"
@@ -94,7 +95,7 @@ def format_watch_line(row) -> str:
     return f"{row.id}. {remark}\n{row.address}"
 
 
-def build_dashboard_text(watch_count: int, today_count: int, month_net: float) -> tuple[str, list]:
+def _build_dashboard_text_legacy(watch_count: int, today_count: int, month_net: float) -> tuple[str, list]:
     return rich_text(
         [
             ("🧠", "brain"),
@@ -107,6 +108,33 @@ def build_dashboard_text(watch_count: int, today_count: int, month_net: float) -
             (f" 本月净额：{format_amount(month_net)} USDT\n", None),
             ("✨", "sparkle"),
             (" 点下面按钮直接操作", None),
+        ]
+    )
+
+
+def build_dashboard_text(
+    watch_count: int,
+    today_count: int,
+    today_income: float,
+    yesterday_income: float,
+    month_net: float,
+) -> tuple[str, list]:
+    return rich_text(
+        [
+            ("🧠", "brain"),
+            (" TRC20 管理后台\n\n", None),
+            ("🖥", "screen"),
+            (f" 监听地址：{watch_count} 个\n", None),
+            ("⏱️", "clock"),
+            (f" 今日记录：{today_count} 笔\n", None),
+            ("➕", "today_income"),
+            (f" 今日收入：{format_amount(today_income)} USDT\n", None),
+            ("➕", "today_income"),
+            (f" 昨日收入：{format_amount(yesterday_income)} USDT\n", None),
+            ("💰", "money"),
+            (f" 本月净额：{format_amount(month_net)} USDT\n", None),
+            ("✨", "sparkle"),
+            (" 时间统一为北京时间，点下面按钮直接操作", None),
         ]
     )
 
@@ -151,13 +179,24 @@ async def render_callback(
 
 
 async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, *, use_edit: bool) -> None:
-    settings, store, _, _ = get_services(context)
-    _, today_since = parse_period("day", settings.timezone_name)
-    _, month_since = parse_period("month", settings.timezone_name)
+    _, store, _, _ = get_services(context)
+    _, today_since = parse_period("day")
+    _, month_since = parse_period("month")
+    beijing_tz = ZoneInfo(DISPLAY_TIMEZONE_NAME)
+    today_start = datetime.now(beijing_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_since = int((today_start.timestamp() - 86400) * 1000)
     watches = await run_blocking(store.list_watches)
     today_rows = await run_blocking(store.list_events, since_ts=today_since, limit=9999)
+    today_stats = await run_blocking(store.get_stats, today_since)
+    yesterday_stats = await run_blocking(store.get_stats, yesterday_since, today_since)
     month_stats = await run_blocking(store.get_stats, month_since)
-    text, entities = build_dashboard_text(len(watches), len(today_rows), month_stats.net)
+    text, entities = build_dashboard_text(
+        len(watches),
+        len(today_rows),
+        today_stats.amount_in,
+        yesterday_stats.amount_in,
+        month_stats.net,
+    )
     if use_edit and update.callback_query is not None:
         await render_callback(update, text, entities, dashboard_keyboard())
     elif update.effective_message is not None:
@@ -242,14 +281,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if data.startswith("menu:history:"):
         period = parts[2]
-        label, since_ts = parse_period(period, settings.timezone_name)
+        label, since_ts = parse_period(period)
         rows = await run_blocking(store.list_events, since_ts=since_ts, limit=settings.history_default_limit)
         if not rows:
             text, entities = rich_text([("⚠️", "warn"), (f" {label}暂无记录。", None)])
             await render_callback(update, text, entities, detail_keyboard())
             return
         lines = []
-        tz = ZoneInfo(settings.timezone_name)
+        tz = ZoneInfo(DISPLAY_TIMEZONE_NAME)
         for row in rows:
             when = datetime.fromtimestamp(int(row["block_timestamp"]) / 1000, tz=tz).strftime("%m-%d %H:%M")
             direction = "转入" if row["direction"] == "in" else "转出"
@@ -260,7 +299,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if data.startswith("menu:stats:"):
         period = parts[2]
-        label, since_ts = parse_period(period, settings.timezone_name)
+        label, since_ts = parse_period(period)
         stats = await run_blocking(store.get_stats, since_ts)
         body = (
             f"转入笔数：{stats.count_in}\n"
@@ -357,7 +396,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await render_message(message, text, entities, detail_keyboard())
             return
         row = rows[0]
-        when = datetime.fromtimestamp(int(row["block_timestamp"]) / 1000, tz=ZoneInfo(settings.timezone_name)).strftime("%Y-%m-%d %H:%M:%S")
+        when = datetime.fromtimestamp(int(row["block_timestamp"]) / 1000, tz=ZoneInfo(DISPLAY_TIMEZONE_NAME)).strftime("%Y-%m-%d %H:%M:%S")
         body = (
             f"备注：{row['remark'] or '未备注'}\n"
             f"监听地址：{row['owner_address']}\n"

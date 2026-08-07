@@ -33,7 +33,7 @@ class MonitorService:
         self.settings = settings
         self.store = store
         self.client = client
-        self.timezone = ZoneInfo(settings.timezone_name)
+        self.timezone = ZoneInfo("Asia/Shanghai")
         self._poll_lock = asyncio.Lock()
 
     async def poll_once(self, bot: Bot | None = None) -> int:

@@ -218,7 +218,7 @@ class Store:
         with self._connect() as conn:
             return conn.execute(query, params).fetchall()
 
-    def get_stats(self, since_ts: int | None = None) -> StatsSummary:
+    def get_stats(self, since_ts: int | None = None, until_ts: int | None = None) -> StatsSummary:
         query = """
             SELECT
                 SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS count_in,
@@ -232,6 +232,9 @@ class Store:
         if since_ts is not None:
             query += " AND block_timestamp >= ?"
             params.append(int(since_ts))
+        if until_ts is not None:
+            query += " AND block_timestamp < ?"
+            params.append(int(until_ts))
         with self._connect() as conn:
             row = conn.execute(query, params).fetchone()
         return StatsSummary(
