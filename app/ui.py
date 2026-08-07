@@ -29,11 +29,15 @@ CUSTOM_EMOJI = {
 }
 
 
+def _utf16_len(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
 def rich_text(parts: list[tuple[str, str | None]]) -> tuple[str, list[MessageEntity]]:
     text = ""
     entities: list[MessageEntity] = []
     for chunk, emoji_key in parts:
-        offset = len(text)
+        offset = _utf16_len(text)
         text += chunk
         if emoji_key:
             emoji_char, custom_emoji_id = CUSTOM_EMOJI[emoji_key]
@@ -41,7 +45,7 @@ def rich_text(parts: list[tuple[str, str | None]]) -> tuple[str, list[MessageEnt
                 MessageEntity(
                     type="custom_emoji",
                     offset=offset,
-                    length=len(emoji_char),
+                    length=_utf16_len(emoji_char),
                     custom_emoji_id=custom_emoji_id,
                 )
             )
