@@ -46,24 +46,23 @@ class MonitorService:
             return total_inserted
 
     async def _poll_watch(self, watch: WatchAddress, bot: Bot | None) -> int:
+        max_ts = watch.last_scan_ts
+        inserted_count = 0
         try:
-            items = await self.client.fetch_usdt_transfers(watch)
+            async for page in self.client.iter_usdt_transfer_pages(watch):
+                for item in sorted(page, key=lambda row: int(row.get("block_timestamp") or row.get("block_ts") or 0)):
+                    event = normalize_transfer(item, watch, self.settings.trc20_usdt_contract)
+                    if event is None:
+                        continue
+                    max_ts = max(max_ts, event.block_timestamp)
+                    if not self.store.insert_event(event):
+                        continue
+                    inserted_count += 1
+                    if bot is not None:
+                        await self._send_notification(bot, event)
         except Exception:
             logger.exception("Failed to fetch transfers for %s", watch.address)
             return 0
-
-        max_ts = watch.last_scan_ts
-        inserted_count = 0
-        for item in sorted(items, key=lambda row: int(row.get("block_timestamp") or row.get("block_ts") or 0)):
-            event = normalize_transfer(item, watch, self.settings.trc20_usdt_contract)
-            if event is None:
-                continue
-            max_ts = max(max_ts, event.block_timestamp)
-            if not self.store.insert_event(event):
-                continue
-            inserted_count += 1
-            if bot is not None:
-                await self._send_notification(bot, event)
 
         if max_ts > watch.last_scan_ts:
             self.store.update_watch_scan_ts(watch.id, max_ts)

@@ -218,6 +218,23 @@ class Store:
         with self._connect() as conn:
             return conn.execute(query, params).fetchall()
 
+    def count_events(self, since_ts: int | None = None, watch_id: int | None = None) -> int:
+        query = """
+            SELECT COUNT(*) AS total
+            FROM transfer_events
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if since_ts is not None:
+            query += " AND block_timestamp >= ?"
+            params.append(int(since_ts))
+        if watch_id is not None:
+            query += " AND address_id = ?"
+            params.append(int(watch_id))
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row["total"] or 0)
+
     def get_stats(self, since_ts: int | None = None, until_ts: int | None = None) -> StatsSummary:
         query = """
             SELECT

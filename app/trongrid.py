@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from decimal import Decimal
 from itertools import cycle
 from typing import Any
@@ -29,6 +30,7 @@ class TronGridClient:
         self._rate_limited_until = 0.0
         self._balance_cache: dict[str, tuple[float, tuple[float, float]]] = {}
         self._balance_cache_ttl_seconds = 60.0
+        self._balance_cache_max_entries = 256
 
     async def close(self) -> None:
         if self._session is not None:
@@ -89,7 +91,22 @@ class TronGridClient:
             raise last_error
         raise RuntimeError("TronGrid request failed")
 
-    async def fetch_usdt_transfers(self, watch: WatchAddress) -> list[dict[str, Any]]:
+    def _prune_balance_cache(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        expired = [
+            address
+            for address, (cached_at, _) in self._balance_cache.items()
+            if now - cached_at > self._balance_cache_ttl_seconds
+        ]
+        for address in expired:
+            self._balance_cache.pop(address, None)
+        overflow = len(self._balance_cache) - self._balance_cache_max_entries
+        if overflow > 0:
+            oldest_addresses = sorted(self._balance_cache.items(), key=lambda item: item[1][0])[:overflow]
+            for address, _ in oldest_addresses:
+                self._balance_cache.pop(address, None)
+
+    async def iter_usdt_transfer_pages(self, watch: WatchAddress) -> AsyncIterator[list[dict[str, Any]]]:
         lookback_ms = self.settings.lookback_minutes * 60 * 1000
         min_timestamp = (
             max(0, int(watch.last_scan_ts) - 60_000)
@@ -110,7 +127,6 @@ class TronGridClient:
 
         fingerprint = ""
         seen: set[str] = set()
-        items: list[dict[str, Any]] = []
         for _ in range(self.settings.max_pages):
             request_params = dict(params)
             if fingerprint:
@@ -129,13 +145,15 @@ class TronGridClient:
             data = payload.get("data") or []
             if not isinstance(data, list):
                 data = []
-            items.extend(item for item in data if isinstance(item, dict))
+            page = [item for item in data if isinstance(item, dict)]
+            if page:
+                yield page
             fingerprint = str(((payload.get("meta") or {}).get("fingerprint")) or "").strip()
             if not fingerprint or not data:
                 break
-        return items
 
     async def fetch_account_balance(self, address: str) -> tuple[float, float]:
+        self._prune_balance_cache()
         cached = self._balance_cache.get(address)
         now = time.time()
         if cached and now - cached[0] <= self._balance_cache_ttl_seconds:
@@ -170,6 +188,7 @@ class TronGridClient:
                 raise
         balances = (trx_balance, usdt_balance)
         self._balance_cache[address] = (now, balances)
+        self._prune_balance_cache(now)
         return balances
 
 

@@ -186,13 +186,13 @@ async def show_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, *, 
     today_start = datetime.now(beijing_tz).replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_since = int((today_start.timestamp() - 86400) * 1000)
     watches = await run_blocking(store.list_watches)
-    today_rows = await run_blocking(store.list_events, since_ts=today_since, limit=9999)
+    today_count = await run_blocking(store.count_events, today_since)
     today_stats = await run_blocking(store.get_stats, today_since)
     yesterday_stats = await run_blocking(store.get_stats, yesterday_since, today_since)
     month_stats = await run_blocking(store.get_stats, month_since)
     text, entities = build_dashboard_text(
         len(watches),
-        len(today_rows),
+        today_count,
         today_stats.amount_in,
         yesterday_stats.amount_in,
         month_stats.net,
