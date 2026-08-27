@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -263,5 +262,4 @@ def normalize_transfer(item: dict[str, Any], watch: WatchAddress, contract_addre
         block_number=int(item.get("block") or item.get("block_number") or 0),
         confirmed=bool(item.get("confirmed", True)),
         contract_address=token_contract or contract_address,
-        raw_json=json.dumps(item, ensure_ascii=False, separators=(",", ":")),
     )

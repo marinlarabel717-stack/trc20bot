@@ -26,7 +26,6 @@ class TransferEvent:
     block_number: int
     confirmed: bool
     contract_address: str
-    raw_json: str
 
 
 @dataclass(slots=True)

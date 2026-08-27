@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +16,10 @@ class Store:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.database_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA temp_store = FILE")
+        conn.execute("PRAGMA cache_size = -4096")
+        conn.execute("PRAGMA mmap_size = 0")
         return conn
 
     def _init_db(self) -> None:
@@ -158,7 +161,7 @@ class Store:
                 (int(last_scan_ts), int(watch_id)),
             )
 
-    def insert_event(self, event: TransferEvent) -> bool:
+    def insert_event(self, event: TransferEvent, raw_json: str) -> bool:
         now = datetime.utcnow().isoformat(timespec="seconds")
         with self._connect() as conn:
             try:
@@ -184,7 +187,7 @@ class Store:
                         event.block_number,
                         1 if event.confirmed else 0,
                         event.contract_address,
-                        event.raw_json,
+                        raw_json,
                         now,
                     ),
                 )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -55,7 +56,8 @@ class MonitorService:
                     if event is None:
                         continue
                     max_ts = max(max_ts, event.block_timestamp)
-                    if not self.store.insert_event(event):
+                    raw_json = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                    if not self.store.insert_event(event, raw_json):
                         continue
                     inserted_count += 1
                     if bot is not None:
