@@ -76,7 +76,7 @@ class MonitorService:
         today_start_ms = int(today_start.timestamp() * 1000)
         today_stats = self.store.get_stats(today_start_ms)
         try:
-            _, usdt_balance = await self.client.fetch_account_balance(event.owner_address)
+            _, usdt_balance = await self.client.fetch_account_balance(event.owner_address, force_refresh=True)
             balance_text = format_amount(usdt_balance)
         except TronGridRateLimitError:
             balance_text = "限流中"

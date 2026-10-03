@@ -151,11 +151,11 @@ class TronGridClient:
             if not fingerprint or not data:
                 break
 
-    async def fetch_account_balance(self, address: str) -> tuple[float, float]:
+    async def fetch_account_balance(self, address: str, *, force_refresh: bool = False) -> tuple[float, float]:
         self._prune_balance_cache()
         cached = self._balance_cache.get(address)
         now = time.time()
-        if cached and now - cached[0] <= self._balance_cache_ttl_seconds:
+        if not force_refresh and cached and now - cached[0] <= self._balance_cache_ttl_seconds:
             return cached[1]
 
         trx_balance = 0.0
